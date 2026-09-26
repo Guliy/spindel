@@ -1133,6 +1133,119 @@
           (rtp/swap-state! child-ctx [world-shape-key] (constantly :mutable))
           (->ForkHandle child-ctx parent-ctx fork-id descriptor authority token))))))))
 
+;; =============================================================================
+;; Adopt: open a fork again on its recorded branches
+;; =============================================================================
+
+;; A fork lives in memory, and a restart loses it. The branches of its
+;; overlays stay in the stores. `fork-record` reads the locator of each
+;; overlay into plain data. `adopt-fork!` builds a new child ctx whose systems
+;; are overlays on those locators. The adapter of each system type knows its
+;; locator, so the two steps are open multimethods: spindel itself depends on
+;; no concrete store.
+
+(defmulti overlay-locator
+  "The data that opens the overlay value `v` again, or nil when the type of
+   `v` has no method. A method returns a map with `:type` (the dispatch value
+   of `reopen-overlay`) and `:locator` (a string). It can add more strings.
+   Keep keywords out of the values: a branch keyword can start with a digit,
+   and no reader takes it back."
+  (fn [v] (type v)))
+
+(defmethod overlay-locator :default [_] nil)
+
+(defmulti reopen-overlay
+  "An overlay over the parent system `psys` on the recorded `entry` (one value
+   of `(:systems record)`). Dispatches on `(:type entry)`. A method throws
+   when the recorded branch is missing from the store."
+  (fn [_sid _psys entry] (:type entry)))
+
+(defn- kw->str [k] (subs (str k) 1))
+
+(defn fork-record
+  "The data that opens the fork of `fork-handle` again after a restart:
+   `{:fork/id s :systems {system-id {:type … :locator s :mode :kind :base-snapshot s}}}`.
+   `overlay-locator` gives the locator of each system of the descriptor.
+   Throws when a system has no locator: the fork cannot open again without it."
+  [fork-handle]
+  (let [child (:child-ctx fork-handle)
+        reg   (registry child)]
+    {:fork/id (kw->str (:fork-id fork-handle))
+     :systems
+     (into {}
+           (for [[sid entry] (get-in fork-handle [:descriptor :fork/systems])]
+             (let [l (some->> (get reg sid) (node-value child) overlay-locator)]
+               (when-not l
+                 (throw (ex-info "fork-record: a system of the fork has no overlay to record"
+                                 {:type ::no-locator :system sid})))
+               [sid (merge l (select-keys entry [:mode :kind])
+                           (when-let [b (:base-snapshot entry)]
+                             {:base-snapshot (str b)}))])))}))
+
+#?(:clj
+   (defn adopt-fork!
+     "Open the fork of `record` (from `fork-record`) again under `parent-ctx`.
+      Returns a `ForkHandle` over a new child ctx with an open authority, and
+      `merge-fork!` and `discard-fork!` work on it as on a new fork.
+
+      The child ctx forks no signal: `ctx/fork-context` gets an empty
+      `:forkable-signals`, so no new branch is made. `reopen-overlay` gives
+      each recorded system its overlay on the recorded locator. The
+      descriptor holds the new fork id, `:fork/adopted-from` (the recorded
+      id), `owner` (default: the fork id of `parent-ctx`) and `purpose`
+      (default `:adopted`).
+
+      Throws when a recorded system is not registered in `parent-ctx` or a
+      recorded branch is missing. The throw comes before the child ctx exists.
+      JVM only: the snapshot reads are synchronous."
+     ([parent-ctx record] (adopt-fork! parent-ctx record {}))
+     ([parent-ctx record {:keys [owner purpose]}]
+      (let [preg   (registry parent-ctx)
+            recsys (:systems record)
+            absent (remove #(contains? preg %) (keys recsys))
+            _      (when (seq absent)
+                     (throw (ex-info "adopt-fork!: a recorded system is not registered in the parent"
+                                     {:type ::missing-system :systems (vec absent)})))
+            shared (select-keys preg (keys recsys))
+            overlays (into {}
+                           (for [[sid sr] shared]
+                             [sid (reopen-overlay sid (ys/effective-system (node-value parent-ctx sr))
+                                                  (get recsys sid))]))
+            child  (ctx/fork-context
+                    parent-ctx
+                    :forkable-signals #{}
+                    :state-updates
+                    {registry-key (backend/full-replacement shared)
+                     :forkable-signals (into #{} (map (comp :id val)) shared)
+                     :nodes (into {}
+                                  (for [[sid sr] shared
+                                        :let [pnode (rtp/get-state parent-ctx [:nodes (:id sr)])]]
+                                    [(:id sr) (nodes/->signal-node (get overlays sid) nil nil false #{}
+                                                                   (inc (or (:generation pnode) 0)))]))})
+            owner  (or owner (:fork-id parent-ctx))
+            token  (random-uuid)
+            authority (atom {:status :open :owner owner :token token})
+            descriptor {:fork/id (:fork-id child)
+                        :fork/parent (:fork-id parent-ctx)
+                        :fork/purpose (or purpose :adopted)
+                        :fork/owner owner
+                        :fork/adopted-from (:fork/id record)
+                        :fork/systems
+                        (into {}
+                              (for [[sid {:keys [mode kind base-snapshot]}] recsys
+                                    :let [csys (ys/effective-system (get overlays sid))]]
+                                [sid {:base-snapshot base-snapshot
+                                      :head (when (satisfies? ygg/Snapshotable csys)
+                                              (ygg/snapshot-id csys))
+                                      :branch (when (satisfies? ygg/Branchable csys)
+                                                (ygg/current-branch csys))
+                                      :mode (or mode :frozen)
+                                      :kind (or kind :overlay)
+                                      :rights :write}]))}]
+        (rtp/swap-state! child [fork-authority-key] (constantly authority))
+        (rtp/swap-state! child [world-shape-key] (constantly :mutable))
+        (->ForkHandle child parent-ctx (:fork-id child) descriptor authority token)))))
+
 ;; `with-fork` is a JVM-only convenience macro. On cljs use the engine form it
 ;; expands to directly: `(ec/with-context (:child-ctx fork) …)`.
 #?(:clj
