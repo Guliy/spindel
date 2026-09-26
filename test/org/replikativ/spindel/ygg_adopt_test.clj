@@ -72,6 +72,51 @@
         (is (= {:x/v "copy" :x/w "base"} (row ctx)))
         (is (not (ygg/open-fork? h)))))))
 
+(deftest the-diff-detail-names-its-base
+  (let [ctx  (world)
+        fork (binding [ec/*execution-context* ctx] (ygg/fork!))]
+    (dh/transact (data-conn (:child-ctx fork)) [{:x/id "r1" :x/v "copy"}])
+    (dh/transact (data-conn ctx) [{:x/id "r1" :x/w "room"}])
+    (let [{:keys [delta base baseless?]} (get (ygg/fork-diff-detail fork) "data")]
+      (is (false? baseless?))
+      (is (some? base))
+      (testing "the delta holds the change of the fork and not the change of the room"
+        (is (some #(= "copy" (nth % 3)) (:added delta)))
+        (is (not-any? #(= "room" (nth % 3)) (:added delta)))))))
+
+(defn- store
+  "A system with the heads \"p\" (parent) and \"f\" (fork). `ancestor` is
+   the common ancestor, or :throw. `diff` of a base in `gone` throws, as the
+   diff of a base that a GC removed."
+  [ancestor gone]
+  (reify
+    yp/Snapshotable
+    (snapshot-id [_] "f")
+    yp/Graphable
+    (common-ancestor [_ _ _]
+      (if (= :throw ancestor) (throw (ex-info "no graph" {})) ancestor))
+    yp/Mergeable
+    (diff [_ a b]
+      (when (contains? gone a) (throw (ex-info "the snapshot is gone" {})))
+      {:from a :to b})))
+
+(defn- parent-head []
+  (reify yp/Snapshotable (snapshot-id [_] "p")))
+
+(def ^:private diff-detail #'ygg/system-diff-detail)
+
+(deftest the-base-of-a-diff-comes-from-the-graph-then-from-the-record
+  (testing "the common ancestor is the base"
+    (is (= {:delta {:from "a" :to "f"} :base "a" :baseless? false}
+           (diff-detail (store "a" #{}) (parent-head) "r"))))
+  (testing "without the graph, the recorded base is the base"
+    (is (= {:delta {:from "r" :to "f"} :base "r" :baseless? false}
+           (diff-detail (store :throw #{}) (parent-head) "r")))))
+
+(deftest a-diff-whose-base-is-gone-says-so
+  (is (= {:delta {:from "p" :to "f"} :base nil :baseless? true}
+         (diff-detail (store "a" #{"a" "r"}) (parent-head) "r"))))
+
 (deftest a-fork-whose-branch-is-gone-does-not-open
   (let [ctx    (world)
         fork   (binding [ec/*execution-context* ctx] (ygg/fork!))

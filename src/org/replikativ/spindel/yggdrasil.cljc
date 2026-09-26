@@ -1365,6 +1365,48 @@
                                   (handle-system-scope fork-handle))]
        (if (fn? x) (await x) x))))))
 
+#?(:clj
+   (defn- system-diff-detail
+     "The diff of the fork in one system, with the base it used:
+      `{:delta d :base snap :baseless? bool}`. The base is the common ancestor
+      of the parent head and the fork head, then `recorded` (the
+      `:base-snapshot` of the descriptor). When neither gives a diff, the
+      delta compares the parent head with the fork head, and `:baseless?` is
+      true: that delta also holds the changes of the parent after the fork.
+      JVM only: the calls are synchronous."
+     [fsys psys recorded]
+     (let [psnap (ygg/snapshot-id psys)
+           fsnap (ygg/snapshot-id fsys)
+           from  (fn [base]
+                   (when base
+                     (try (when-let [d (ygg/diff fsys base fsnap)]
+                            {:delta d :base base :baseless? false})
+                          (catch Throwable _ nil))))]
+       (or (from (try (ygg/common-ancestor fsys psnap fsnap) (catch Throwable _ nil)))
+           (from recorded)
+           {:delta (try (ygg/diff fsys psnap fsnap)
+                        (catch Throwable t (ygt/diff-error psnap fsnap (ex-message t))))
+            :base nil
+            :baseless? true}))))
+
+#?(:clj
+   (defn fork-diff-detail
+     "The diff of each system of `fork-handle`, with the base it used:
+      `{system-id {:delta d :base snap :baseless? bool}}`. The scope is the
+      scope of `fork-diff`. `fork-diff` does not say which base it used; a
+      reader that must know that a base is missing uses this function. JVM
+      only."
+     [fork-handle]
+     (let [child (:child-ctx fork-handle)]
+       (into {}
+             (for [[sid _ cval psys] (scoped-shared-pairs child (:parent-ctx fork-handle)
+                                                          (handle-system-scope fork-handle))
+                   :let [fsys (ys/effective-system cval)]
+                   :when (and (satisfies? ygg/Mergeable fsys) (satisfies? ygg/Graphable fsys))]
+               [sid (system-diff-detail
+                     fsys psys
+                     (get-in fork-handle [:descriptor :fork/systems sid :base-snapshot]))])))))
+
 (defn fork-conflicts
   "Conflict projection restricted to `fork-handle`'s settlement scope."
   [fork-handle]
