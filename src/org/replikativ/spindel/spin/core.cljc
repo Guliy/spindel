@@ -814,8 +814,9 @@
       ;; canceller receives `cont`; all others skip it.
       (when-let [cont (ec/continuation-remove! sid cont-id {:cancel? true})]
         (if (::simple/resume-in-flight? cont)
-          ;; Completion linearized first and owns this reactive CPS slice.
-          ;; Remove its future graph edge, but do not reject the same slice.
+          ;; Completion linearized first and owns this reactive CPS slice, or
+          ;; already resumed it (the body has moved past this await). Remove
+          ;; its future graph edge, but do not reject the same slice.
           ;; Cooperative cancellation is already cached on the parent and will
           ;; be observed at its next await point.
           (when-let [child (:awaited-spin cont)]
@@ -863,6 +864,34 @@
     (doseq [child (ec/get-state [:nodes sid :owned-spins])]
       (when (and child (nil? (ec/spin-current-result (spin-id child))))
         (cancel-spin! child)))))
+
+(defn ^:no-doc cancelled-after-registration
+  "Re-check cancellation once the continuation `registered` (the map passed
+  to `continuation-add!`, with its `:id` and `:registration`) of `sid` is
+  registered, and claim it if so.
+
+  cancel-spin! caches the cancellation and then reads the parked
+  continuations; a registration that passed its entry check before the cache
+  write and became visible after the read is seen by neither, and parks
+  forever. Re-checked after registration, one of the two always sees the
+  other. Returns nil when `sid` is not cancelled, else `{:result r}`: `r` is
+  what `reject` returned for the claimed slice, or `incomplete` when
+  cancel-spin! (or a completion) claimed it first and owns it."
+  [sid registered reject]
+  (when (ec/spin-is-cancelled? sid)
+    {:result
+     (let [cont (ec/continuation-remove! sid (:id registered)
+                                         {:cancel? true
+                                          ;; this registration only, never a newer
+                                          ;; one at the same deterministic id
+                                          :only-registration (:registration registered)})]
+       (if (and cont (not (::simple/resume-in-flight? cont)))
+         (resume reject
+                 (or (:payload (ec/spin-current-result sid))
+                     (ex-info "Spin cancelled"
+                              {:type spin-cancelled
+                               :spin-id sid})))
+         incomplete))}))
 
 (defn cleanup-spin!
   "Manually clean up a spin, removing it from the runtime.
