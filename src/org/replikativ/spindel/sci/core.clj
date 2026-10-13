@@ -6,7 +6,43 @@
   - COMMON_CLASSES - Class allowlist for SCI contexts
 
   This is the single source of truth for SCI context setup."
-  (:require [sci.core :as sci]))
+  (:require [sci.core :as sci]
+            [sci.ctx-store :as ctx-store]
+            [org.replikativ.spindel.engine.core :as ec]))
+
+(defn ^:no-doc same-world-or-descendant?
+  "True when `candidate` is the captured world or one of its COW descendants.
+
+  Continuation slice restoration may construct another ExecutionContext record
+  for the same branch, so stable fork identity—not object identity—is the base
+  case."
+  [candidate captured]
+  (loop [ctx candidate]
+    (cond
+      (nil? ctx) false
+      (= (:fork-id ctx) (:fork-id captured)) true
+      :else (recur (:parent-ctx ctx)))))
+
+(defn- world-bound-fn
+  "partial-cps's `bound-fn` for SCI code: conveys the creator's bindings as
+  `bound-fn*` does, but not its world over a fork's. Called in the captured
+  world or a COW descendant, `f` runs in the calling world and interpreter (an
+  interpreter forked after wrapping it acts in the fork, on the fork's vars);
+  called elsewhere, in the captured ones — the continuation rule of
+  `macro/invoke-sci-awaitable`."
+  [f]
+  (let [captured (when (ec/execution-context-bound?) (ec/current-execution-context))
+        g (bound-fn* (fn [overrides args]
+                       (with-bindings overrides (apply f args))))]
+    (fn [& args]
+      (let [ambient (when (ec/execution-context-bound?) (ec/current-execution-context))
+            here? (and ambient (or (nil? captured)
+                                   (same-world-or-descendant? ambient captured)))
+            interpreter ctx-store/*ctx*]
+        (g (cond-> {}
+             here? (assoc #'ec/*execution-context* ambient)
+             (and here? interpreter) (assoc #'ctx-store/*ctx* interpreter))
+           args)))))
 
 ;; =============================================================================
 ;; CPS Runtime Loading
@@ -43,7 +79,8 @@
   ;; macros emit (this bit the SCI spin/gen-aseq path via `runtime/thunk?`). All runtime
   ;; publics are plain native fns / the ONE compiled Thunk ctor, so this stays canonical.
   (sci/add-namespace! sci-ctx 'is.simm.partial-cps.runtime
-                      (update-vals (ns-publics 'is.simm.partial-cps.runtime) deref))
+                      (assoc (update-vals (ns-publics 'is.simm.partial-cps.runtime) deref)
+                             'bound-fn world-bound-fn))
   (let [ioc-src (slurp (clojure.java.io/resource "is/simm/partial_cps/ioc.clj"))
         async-src (slurp (clojure.java.io/resource "is/simm/partial_cps/async.cljc"))]
     (sci/eval-string* sci-ctx ioc-src)
@@ -91,8 +128,12 @@
   ;; Ensure namespaces are loaded before referencing their deftypes
   (require 'is.simm.partial-cps.runtime)
   (require 'org.replikativ.spindel.spin.core)
-  {'clojure.lang.Var clojure.lang.Var
-   'clojure.lang.Namespace clojure.lang.Namespace
+  {;; Named (`instance?`), never called: their static members (`find`,
+   ;; `intern`, `getThreadBindings`, …) hand code the HOST's vars, so its
+   ;; functions run outside the sandbox, and its dynamic bindings, the live
+   ;; execution context among them.
+   'clojure.lang.Var {:class clojure.lang.Var :closed true}
+   'clojure.lang.Namespace {:class clojure.lang.Namespace :closed true}
    'clojure.lang.IFn clojure.lang.IFn
    'clojure.lang.Atom clojure.lang.Atom
    'clojure.lang.IDeref clojure.lang.IDeref
