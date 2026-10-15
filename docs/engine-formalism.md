@@ -170,9 +170,25 @@ law is **scoped to the synchronous sub-graph** — see the async caveat.
   `engine/impl/graph.cljc:30-81`) over the transitive observer closure.
   **Holds** for the synchronous portion of the graph.
 * **Descendant filtering.** `compute-descendant-observers`
-  (`engine/impl/simple.cljc:448-461`) removes observers that will be
-  re-created by a parent observer, preventing them from firing
-  independently. **Holds.**
+  (`engine/impl/simple.cljc`) finds observers created by another
+  observer; `delegated-descendants` keeps those the creator's resume
+  really re-creates — the creator's resume cont must PRECEDE the child's
+  registration — its `:order` is within the creator's continuation count
+  at the registration (`:creator-cont-mark`, an O(1) watermark recorded
+  by `register-spin!`). `:order` is count-based, so this relies on the
+  continuations counted in the mark outliving the registration; where a
+  cont is removed in between, the test errs either way — an extra
+  independent resume, or a wrongly delegated child left `:dirty` (re-run
+  when next reached) instead of eagerly re-run; no violation has been
+  constructed — or
+  the creator must itself be a delegated descendant (it re-runs from
+  scratch). Those are filtered and *invalidated* in the same step
+  (`invalidate-node`), so deferring the re-run to the parent never leaves
+  a stale `:clean` cache behind (3.4). A child created *before* the
+  creator's resume point — `(let [c (spin (track a) …) x (await c) v
+  (track a)] …)` — is not re-created by that resume, so it is resumed
+  like an independent observer (it used to be filtered too, and the
+  parent glitched: `[1 2]` for `[2 2]`). **Holds.**
 * **Escalation.** `find-root-await-ancestor` escalates a child observer
   to its root await-ancestor so child-fires-then-parent-refires
   double-execution is avoided (`engine/impl/simple.cljc:463-490`,
@@ -246,6 +262,11 @@ if the key set differs *or* any value is not `identical?` to its prior.
 * **Idempotence** — re-registering with `identical?` captures leaves the
   node `:clean` and `:completed?` true: `await`/`@spin` serve the cache.
   **Holds.**
+* **Re-registration with changed captures** invalidates the node's run
+  generation (`invalidate-node`): any run of the old closure — in flight,
+  or re-completed later by a track resume — closes over the old
+  captures, and its result must not be certified `:clean` (3.4,
+  generation rule). Only a fresh body entry certifies again. **Holds.**
 * **`identical?` not `=`** — O(1), never throws; Clojure structural
   sharing keeps unchanged persistent values `identical?`. The cost is an
   occasional needless re-run when a value is rebuilt `=`-equal but not
@@ -379,7 +400,7 @@ flowchart TD
     E --> F["clear-all-await-continuations! (reap :await-once/:external-await)"]
     F --> G["ordered-observers: topological sort of transitive closure"]
     G --> H["keep observers with a live track cont for sid"]
-    H --> I["filter descendant observers; escalate await-children to root"]
+    H --> I["filter descendant observers (invalidate-node them); escalate await-children to root"]
     I --> J["for each independent observer: resume-body! mode :track"]
     J --> K["truncate-stale-conts! (order > track cont)"]
     K --> L["restore :slice-state (bindings, chain-head, tracking)"]
@@ -450,6 +471,9 @@ stateDiagram-v2
     [*] --> Registered: make-spin (3-arity) → register-spin! :computation
     Registered --> Running: (spin r e) invoke Case 2 / :spin-execution / await slow path
     Running --> Completed: outer resolve → cache-result! (:clean, completed?, running?=false)
+    Running --> StaleRun: invalidated in flight → invalidate-node (:dirty, :invalid-gen = :run-gen)
+    StaleRun --> Dirty: outer resolve OR reject → cache-result! (result kept, NOT certified :clean)
+    StaleRun --> Running: fresh body entry (enter-body! → new :run-gen; prologue cancels the stale run, hands its callbacks over)
     Running --> Suspended: body returns the incomplete sentinel (await/track)
     Suspended --> Running: resume-body! (cont fires)
     Completed --> Dirty: dependency changed → mark-dirty! / cache-result! cascade
@@ -572,6 +596,86 @@ the truncated cont simply ceases to exist, so the child's
 `:spin-completion` finds no subscriber for the old cont. The
 re-running body re-issues a fresh `await X` cont. **Holds** — this is
 the `cont_cancellation_test` suite (deferred, mailbox, fork-isolation).
+
+**Generation rule (no stale certification).** The truncation above
+covers the case where the spin is *resumed* at its track point. A spin
+can also be invalidated without being resumed, while a run of it is in
+flight:
+
+* a `:signal-change` filters it out as a *descendant observer* — its
+  re-run is delegated to the ancestor that re-creates it (1.4);
+* a re-running parent re-registers it with *changed captures* (B-gate,
+  1.6).
+
+Neither truncates the in-flight run, and they must not: an awaiter
+outside the re-running subtree may be parked on it, and would be
+stranded. The invariant is instead: **a run may cache its result as
+`:clean` only if nothing invalidated the node since the run began.**
+It is enforced with *run generations* (`engine/impl/simple.cljc`):
+
+* every fresh body entry (`enter-body!` → `mark-running!`) stamps the
+  node with a new, process-wide unique `:run-gen` and returns it; the
+  run's resolve/reject continuations (`-invoke` Case 2, the await slow
+  path) hand it back to `cache-result!`;
+* `invalidate-node` records the generation it invalidates
+  (`:invalid-gen`) and marks the node `:dirty`; `:completed?` is left
+  alone (it says the body finished — the GC reap predicate needs it);
+* `cache-result!` ignores a completion whose generation is no longer the
+  node's (an older run finishing after a newer one entered — a boolean
+  mark could not tell the two runs apart); for the current generation it
+  stores the result but certifies it `:clean` only if that generation was
+  not invalidated. The mark is not consumed, so a second write of the
+  same run (a reject path re-caching through `abort-spin-chain!`, which
+  passes the same generation) cannot certify it either; nor can a later
+  track resume of the same run. A node that never entered a run has no
+  generation and is only marked `:dirty`;
+* a stale run is never joined: `try-claim-execution!` and `deref` start a
+  fresh run instead. The fresh entry (`mark-running!`, in the same
+  transaction as the generation stamp) hands the superseded run's
+  never-served invoker callbacks to the new run (`:run-callbacks` →
+  `:pending-callbacks`); `cache-result!` drops the record in the same
+  transaction as the run's completing write. The contract is **at most
+  once per world**: within a world a caller callback is served by its run
+  or by the run it was handed to, never both. The record is fork-local, so
+  each world decides for itself; a `:causal-follow` callback is served
+  once per world that completes the run — the engine's existing
+  cross-world fan-out (forking.md), which a savepoint's terminal site
+  dedups per world. Nothing is shared between worlds to arbitrate it
+  (that would leak a fork's completion into its parent's decisions);
+* a superseding run that completes *inline* (the await slow path) still
+  enqueues `:spin-completion` when other awaiters are subscribed to the
+  child — the superseded run's completion is ignored as outdated, so the
+  event is their only wakeup. The inline awaiter's own cont is claimed
+  inline, so it is not resumed twice.
+
+So whoever *reaches* the node next — inside the batch or in a later
+drain — re-runs it against the current values. Nothing schedules that
+re-run by itself: an awaiter already parked on the stale run receives
+the stale value, and catches up only if the node is re-run and
+re-completes (its reactive await cont then fires) — e.g. when its
+creator reaches it. A stale node nobody reaches again stays `:dirty`.
+
+Why the descendant must be invalidated *eagerly*: its freshness used to
+rest on the batch-mode await fast-path guard (`await-spin` refuses a
+cache hit during a batch unless the child was processed in it). That
+covers an ancestor whose re-run reaches the child synchronously within
+the batch. An ancestor that suspends first — an `ifor-each` awaiting a
+newly *prepended* item that awaits a deferred — reaches the old child
+only after the batch has ended; the child's still-`:clean` cache (or
+its in-flight run, completing on the delivery) was then served as is,
+permanently. (Regression: `engine/stale_run_test.cljc`; the
+differential DOM fuzzer's defect 1 in
+`dom/differential_fuzz_regressions_test.cljs`.) This also makes
+`events-settled?`'s promise ("what is clean is current") true for
+descendant observers.
+
+**Open subtlety (GC of a removed descendant).** An item removed by the
+same change that invalidated it is never re-created, but it keeps its
+track continuation on the signal; `gc-quiescent?` refuses to reap a spin
+with a track subscription, so the Cleaner only marks it `:orphaned?`, and
+the next change of the signal resumes it as an independent observer.
+This predates the generation rule (the descendant was already left with
+its cont) and is not changed by it.
 
 **Open subtlety.** Conts with `:order` *less* than the resumed one are
 *kept* and their signal deps re-tracked (`engine/impl/simple.cljc:357-361`)
