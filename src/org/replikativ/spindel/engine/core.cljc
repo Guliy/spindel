@@ -149,6 +149,88 @@
 ;; Accessors
 ;; ----------------------------------------------------------------------------
 
+;; -----------------------------------------------------------------------------
+;; Home context: a stable record for weak references
+;; -----------------------------------------------------------------------------
+;;
+;; Context records are values: every binding change (`assoc` of :bindings,
+;; the per-body scope of every spin run, the drain's normalization) makes a
+;; new, short-lived record over the same backend. A GC callback that must
+;; reach a context (spin cleanup) can hold it only weakly — a strong
+;; reference from a cleaner registry, a GC root, pins it — but a weak
+;; reference to whatever record happened to be bound clears as soon as that
+;; record is garbage, long before the context is. The callback then finds
+;; nothing and silently does no cleanup (measured: 774 of 779 spin cleanups
+;; in the jsdom fuzz suite were dropped this way).
+;;
+;; So each context (root, fork, restored snapshot) carries a :home cell
+;; holding its creation record. Every record derived by `assoc` shares the
+;; cell, so the home record stays reachable exactly as long as some record
+;; of the context is — the right lifetime for a weak reference.
+
+(declare home-context)
+
+(defn ^:no-doc with-home
+  "Stamp `ctx` with a fresh :home cell that holds the stamped record, and a
+  fresh registry of its following forks (`register-following-fork!`)."
+  [ctx]
+  (let [cell (volatile! nil)
+        ctx (assoc ctx
+                   :home cell
+                   :following-forks (atom []))]
+    (vreset! cell ctx)
+    ctx))
+
+;; A FOLLOWING fork reads every path it has not written through from its
+;; parent's live state, so a write in the parent is a write in the fork.
+;; Engine decisions that are one world's to make — "the creator no longer
+;; holds this child, detach it" — must not be written into state a
+;; following fork still reads (`release-superseded-children!`). The parent
+;; therefore keeps weak references to its following forks: a fork counts
+;; while it is reachable, and stops counting once it is garbage.
+
+;; On a JS runtime without WeakRef (pre-ES2021) a fork cannot be tracked
+;; without pinning it for good. The registry then records a fork that holds
+;; no reference at all and counts as reachable forever: once such a context
+;; has had a following fork, superseded children are never detached there
+;; (the pre-fix behaviour), but no fork is retained by the registry. Those
+;; runtimes have no FinalizationRegistry either, so no spin is ever reaped
+;; by GC on them anyway.
+(defn- weak-ref [x]
+  #?(:clj (java.lang.ref.WeakReference. x)
+     :cljs (if (exists? js/WeakRef)
+             (js/WeakRef. x)
+             #js {:deref (constantly true)})))
+
+(defn- weak-get [r]
+  #?(:clj (.get ^java.lang.ref.WeakReference r)
+     :cljs (.deref ^js r)))
+
+(defn ^:no-doc register-following-fork!
+  "Record `fork` (weakly) as a following fork of `parent`."
+  [parent fork]
+  (when-let [reg (:following-forks parent)]
+    (let [r (weak-ref (home-context fork))]
+      (swap! reg (fn [rs] (conj (filterv weak-get rs) r)))))
+  fork)
+
+(defn ^:no-doc following-forks?
+  "Whether `ctx` has a following fork that is still reachable."
+  [ctx]
+  (boolean (when-let [reg (:following-forks ctx)]
+             (some weak-get @reg))))
+
+(defn ^:no-doc home-context
+  "The home record of `ctx` (see `with-home`): stable for as long as the
+  context is in use, so it is what a weak reference should point at. Falls
+  back to `ctx` itself when it has no home or its home is over a different
+  backend (a record re-pointed at a new backend without re-stamping)."
+  [ctx]
+  (let [h (some-> (:home ctx) deref)]
+    (if (and h (identical? (:backend h) (:backend ctx)))
+      h
+      ctx)))
+
 (defn current-execution-context
   "Return dynamically bound execution context.
 

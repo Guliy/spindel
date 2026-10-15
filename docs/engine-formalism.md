@@ -669,13 +669,58 @@ differential DOM fuzzer's defect 1 in
 `events-settled?`'s promise ("what is clean is current") true for
 descendant observers.
 
-**Open subtlety (GC of a removed descendant).** An item removed by the
-same change that invalidated it is never re-created, but it keeps its
-track continuation on the signal; `gc-quiescent?` refuses to reap a spin
-with a track subscription, so the Cleaner only marks it `:orphaned?`, and
-the next change of the signal resumes it as an independent observer.
-This predates the generation rule (the descendant was already left with
-its cont) and is not changed by it.
+**Superseded children (GC of a removed descendant).** An item removed by
+a change is never re-created, but it keeps its own track continuation on
+the signal — and that continuation reaches the item's Spin object (body
+continuation → the resolve its awaiter passed in → the awaiter's loop
+state, e.g. an `ifor-each` holding all its item spins), so the Spin is
+never collected and the Cleaner never runs. `gc-quiescent?` would refuse
+it anyway (track subscription), and the next change of the signal resumed
+it as an independent observer. The rule now:
+
+- A run of a creator holds a set of children, `live-children`: those it
+  (re-)registered (`:created-spins`) plus, after a track resume, those
+  created *before* the resume point (`:kept-children`, snapshotted on the
+  track cont as `:slice-state :live-children`), which the resumed slice
+  does not re-evaluate. Each new run records what it starts out not
+  holding (`:dropped-children`).
+- When the creator's run completes (`record-deps!` →
+  `release-superseded-children!`), ONE transaction (`detach-superseded`)
+  re-checks and detaches every dropped child that still names that
+  creator, is not held by it, is observed by no other spin, has no run in
+  flight and no caller waiting on one, and is owned by this world — then,
+  transitively, what each detached child held. Detaching drops its conts
+  and subscriptions (one pass over `:subscriptions` for the whole set),
+  prunes its observer edges and empties its deps, and sets `:detached?`.
+  Only a child that could have gone stale (`signal-dependent?`: it
+  tracked a signal, directly or through a spin it awaited — an await
+  alone leaves a persistent `:await-reactive` cont and does not count) is
+  marked dirty; any other keeps its clean result, so a holder of its Spin
+  awaiting it later does not re-run its effects. A child whose run was in flight is checked when that run
+  completes (error completions too).
+- Not while the context has a reachable **following** fork
+  (`ec/following-forks?`): a following fork reads every node it has not
+  written through from this world, so a detach decided by this world's
+  creator would also detach the child in a fork whose own creator still
+  holds it. The candidates stay recorded and the generation sweep retries
+  once the fork is gone. The release, the sweep's retry and the deferral
+  record only touch nodes the running world owns: a fork's sweep never
+  acts on a creator it reads through from its parent (writing even its
+  `:dropped-children` would copy it into the overlay and stop the fork
+  following it). On a JS runtime without `WeakRef` a fork cannot be
+  tracked without pinning it, so the registry records an unreferenced
+  marker that never expires: such a context defers detaching for good once
+  it has had a following fork.
+- A detached node is quiescent even if it was invalidated and never
+  re-ran (`gc-quiescent?` accepts `:detached?` for `:completed?`): it is
+  reaped once its Spin is collected, or in the same transaction if it
+  already was. `superseded-child?` makes `gc-quiescent?` accept an orphan
+  whose creator exists, is complete and no longer holds it, despite
+  remaining track conts; a creator absent from the world proves nothing
+  (`*spin-id*` can name a spin of another context).
+
+Regressions: `engine/context_retention_test.clj`, and the jsdom
+differential `removed-item-is-reaped-after-same-change-removal`.
 
 **Open subtlety.** Conts with `:order` *less* than the resumed one are
 *kept* and their signal deps re-tracked (`engine/impl/simple.cljc:357-361`)
