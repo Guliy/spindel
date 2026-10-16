@@ -70,3 +70,101 @@
         (ygg/register! (cdvcs/cdvcs "cd" {:store-config {:backend :memory :id (random-uuid)}} {:sync? true}))
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"neither :branchable"
                               (ygg/fork!)))))))
+
+(deftest a-fork-that-merged-a-nested-fork-merges-everything
+  (testing "outer overlay fork, inner fork of it: inner merges into outer, outer into root, both land"
+    (let [ctx (sp/create-execution-context)]
+      (sp/with-context ctx
+        (let [kref (ygg/register! (-> (mem-gset "kb") (g/conj :shared)))
+              outer (ygg/fork! {:convergent-fork :overlay})]
+          (ygg/with-fork outer
+            (ovl/overlay-swap! @(ygg/system-signal "kb") (fn [s] (g/conj s :outer)))
+            (let [inner (ygg/fork! {:convergent-fork :overlay})]
+              (ygg/with-fork inner
+                (ovl/overlay-swap! @(ygg/system-signal "kb") (fn [s] (g/conj s :inner))))
+              (ygg/merge-fork! inner))
+            (is (ovl/overlay? @(ygg/system-signal "kb"))
+                "the outer fork still holds its overlay after absorbing the inner one")
+            ;; a :following overlay's writable system holds the fork's own writes
+            (is (= #{:outer :inner} (g/elements (ovl/overlay-system @(ygg/system-signal "kb"))))
+                "the inner write joined the outer fork's own writes"))
+          (is (= #{:shared} (g/elements @kref)) "the root is untouched until the outer merge")
+          (ygg/merge-fork! outer)
+          (is (= #{:shared :outer :inner} (g/elements @kref))
+              "the outer merge lands its own write and the inner one"))))))
+
+(deftest sibling-nested-forks-both-land
+  (testing "two overlay forks of an overlay fork: merging both keeps both, and the outer merge lands all"
+    (let [ctx (sp/create-execution-context)]
+      (sp/with-context ctx
+        (let [kref (ygg/register! (-> (mem-gset "kb") (g/conj :shared)))
+              outer (ygg/fork! {:convergent-fork :overlay})]
+          (ygg/with-fork outer
+            (ovl/overlay-swap! @(ygg/system-signal "kb") (fn [s] (g/conj s :outer)))
+            (let [a (ygg/fork! {:convergent-fork :overlay})
+                  b (ygg/fork! {:convergent-fork :overlay})]
+              (ygg/with-fork a (ovl/overlay-swap! @(ygg/system-signal "kb") (fn [s] (g/conj s :a))))
+              (ygg/with-fork b (ovl/overlay-swap! @(ygg/system-signal "kb") (fn [s] (g/conj s :b))))
+              (ygg/merge-fork! a)
+              (ygg/merge-fork! b)))
+          (ygg/merge-fork! outer)
+          (is (= #{:shared :outer :a :b} (g/elements @kref))
+              "the second sibling's merge did not drop the first's"))))))
+
+(deftest a-branch-fork-of-an-overlay-fork-merges-everything
+  (testing "outer overlay fork, inner default (branch) fork of it: both land"
+    (let [ctx (sp/create-execution-context)]
+      (sp/with-context ctx
+        (let [kref (ygg/register! (-> (mem-gset "kb") (g/conj :shared)))
+              outer (ygg/fork! {:convergent-fork :overlay})]
+          (ygg/with-fork outer
+            (ovl/overlay-swap! @(ygg/system-signal "kb") (fn [s] (g/conj s :outer)))
+            (let [inner (ygg/fork!)]
+              (ygg/with-fork inner
+                (swap! (ygg/system-signal "kb") (fn [s] (g/conj s :inner))))
+              (ygg/merge-fork! inner))
+            (is (ovl/overlay? @(ygg/system-signal "kb")) "the outer fork keeps its overlay"))
+          (ygg/merge-fork! outer)
+          (is (= #{:shared :outer :inner} (g/elements @kref))))))))
+
+(defrecord ^:private JoinSet [xs on-join]
+  yggdrasil.convergent/PConvergent
+  (-join [this other] (yggdrasil.convergent/-join this other {}))
+  (-join [_ other _opts]
+    (when on-join (on-join))
+    (->JoinSet (into xs (:xs other)) nil)))
+
+(defrecord ^:private TestOverlay [parent local-writes mode])
+
+(deftest a-write-during-a-nested-merge-is-kept
+  (testing "an in-place write to the parent overlay while a merge joins into it is not lost"
+    (let [cell (atom nil)
+          ov (->TestOverlay nil cell :frozen)
+          fired (atom false)]
+      ;; the join of the value read lets another writer land first
+      (reset! cell (->JoinSet #{:outer}
+                              #(when (compare-and-set! fired false true)
+                                 (swap! cell (fn [c] (->JoinSet (conj (:xs c) :concurrent) nil))))))
+      (is (ovl/overlay? ov))
+      (#'ygg/join-into-overlay! ov (->JoinSet #{:outer :inner} nil) {:sync? true})
+      (is @fired "the interleaving happened")
+      (is (= #{:outer :inner :concurrent} (:xs @cell)) "retried against the new value: nothing lost")
+      (is (identical? cell (:local-writes ov)) "in place: the same overlay and cell"))))
+
+(deftest a-merge-into-a-re-registered-system-is-refused
+  (testing "the parent's registration changes while the join is pending: no seat, it throws"
+    (let [ctx (sp/create-execution-context)]
+      (sp/with-context ctx
+        (ygg/register! (mem-gset "kb"))
+        (let [reg #(org.replikativ.spindel.engine.protocols/get-state ctx [ygg/registry-key])
+              ref (get (reg) "kb")
+              ;; the join of the value read lets the registration change first
+              cell (atom nil)
+              _ (reset! cell (->JoinSet #{:outer}
+                                        #(org.replikativ.spindel.engine.protocols/swap-state!
+                                          ctx [ygg/registry-key] (fn [m] (assoc m "kb" (assoc ref :id (random-uuid)))))))
+              ov (->TestOverlay nil cell :frozen)]
+          (#'ygg/set-node-value! ctx ref ov)
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"shape changed"
+                                (#'ygg/seat-merged! ctx "kb" ref (->JoinSet #{:outer :inner} nil) {:sync? true})))
+          (is (= #{:outer} (:xs @cell)) "nothing seated into the detached overlay"))))))
